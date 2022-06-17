@@ -1,0 +1,52 @@
+From 482f9671c69800de2077d2dab9352a9b385115d3 Mon Sep 17 00:00:00 2001
+From: Lubomir Rintel <lkundrak@v3.sk>
+Date: Tue, 22 Feb 2022 16:18:40 +0100
+Subject: [PATCH] ovs-port: fix removal of ovsdb entry if the interface goes
+ away
+
+Hope third time is the charm.
+
+The idea here is to remove the OVSDB entry if the device actually went away
+violently (like, the it was actually removed from the platform), but keep it if
+we're shutting down.
+
+Fixes-test: @ovs_nmstate
+Fixes: 966413e78f14 ('ovs-port: avoid removing the OVSDB entry if we're shutting down')
+Fixes: ecc73eb239e6 ('ovs-port: always remove the OVSDB entry on slave release')
+
+https://bugzilla.redhat.com/show_bug.cgi?id=2055665
+(cherry picked from commit 65fdfb25006acc3c67059792579dd7a770d04768)
+(cherry picked from commit fee7328c86e5fe8171f8382492f147e7d263891b)
+---
+ src/core/devices/ovs/nm-device-ovs-port.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/src/core/devices/ovs/nm-device-ovs-port.c b/src/core/devices/ovs/nm-device-ovs-port.c
+index 8406c3648cef..116f58c43ace 100644
+--- a/src/core/devices/ovs/nm-device-ovs-port.c
++++ b/src/core/devices/ovs/nm-device-ovs-port.c
+@@ -188,8 +188,10 @@ del_iface_cb(GError *error, gpointer user_data)
+ static void
+ release_slave(NMDevice *device, NMDevice *slave, gboolean configure)
+ {
+-    NMDeviceOvsPort *self = NM_DEVICE_OVS_PORT(device);
+-    bool slave_removed = nm_device_sys_iface_state_get(slave) == NM_DEVICE_SYS_IFACE_STATE_REMOVED;
++    NMDeviceOvsPort *self              = NM_DEVICE_OVS_PORT(device);
++    bool             slave_not_managed = !NM_IN_SET(nm_device_sys_iface_state_get(slave),
++                                        NM_DEVICE_SYS_IFACE_STATE_MANAGED,
++                                        NM_DEVICE_SYS_IFACE_STATE_ASSUME);
+ 
+     _LOGI(LOGD_DEVICE, "releasing ovs interface %s", nm_device_get_ip_iface(slave));
+ 
+@@ -197,7 +199,7 @@ release_slave(NMDevice *device, NMDevice *slave, gboolean configure)
+      * removed and thus we're called with configure=FALSE), we still need
+      * to make sure its OVSDB entry is gone.
+      */
+-    if (configure || slave_removed) {
++    if (configure || slave_not_managed) {
+         nm_ovsdb_del_interface(nm_ovsdb_get(),
+                                nm_device_get_iface(slave),
+                                del_iface_cb,
+-- 
+2.35.1
+

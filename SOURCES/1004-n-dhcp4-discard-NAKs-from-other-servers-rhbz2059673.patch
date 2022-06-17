@@ -1,0 +1,82 @@
+From 118561e284ff7f28421b19530d4471075b89645c Mon Sep 17 00:00:00 2001
+From: Beniamino Galvani <bgalvani@redhat.com>
+Date: Thu, 10 Mar 2022 12:07:49 +0100
+Subject: [PATCH] n-dhcp4: discard NAKs from other servers in SELECTING
+
+I got a report of a scenario where multiple servers reply to a REQUEST
+in SELECTING, and all servers send NAKs except the one which sent the
+offer, which replies with a ACK. In that scenario, n-dhcp4 is not able
+to obtain a lease because it restarts from INIT as soon as the first
+NAK is received. For comparison, dhclient can get a lease because it
+ignores all NAKs in SELECTING.
+
+Arguably, the network is misconfigured there, but it would be great if
+n-dhcp4 could still work in such scenario.
+
+According to RFC 2131, ACK and NAK messages from server must contain a
+server-id option. The RFC doesn't explicitly say that the client
+should check the option, but I think it's a reasonable thing to do, at
+least for NAKs.
+
+This patch stores the server-id of the REQUEST in SELECTING, and
+compares it with the server-id from NAKs, to discard other servers'
+replies.
+
+https://gitlab.freedesktop.org/NetworkManager/NetworkManager/-/merge_requests/1144
+---
+ src/n-dhcp4/src/n-dhcp4-c-connection.c | 19 +++++++++++++++++++
+ src/n-dhcp4/src/n-dhcp4-private.h      |  1 +
+ 2 files changed, 20 insertions(+)
+
+diff --git a/src/n-dhcp4/src/n-dhcp4-c-connection.c b/src/n-dhcp4/src/n-dhcp4-c-connection.c
+index 4aba97393d..2f660e3b30 100644
+--- a/src/n-dhcp4/src/n-dhcp4-c-connection.c
++++ b/src/n-dhcp4/src/n-dhcp4-c-connection.c
+@@ -705,6 +705,7 @@ int n_dhcp4_c_connection_select_new(NDhcp4CConnection *connection,
+         message->userdata.start_time = offer->userdata.start_time;
+         message->userdata.base_time = offer->userdata.base_time;
+         message->userdata.client_addr = client.s_addr;
++        message->userdata.server_id = server.s_addr;
+         n_dhcp4_incoming_get_xid(offer, &xid);
+         n_dhcp4_outgoing_set_xid(message, xid);
+ 
+@@ -1224,6 +1225,24 @@ int n_dhcp4_c_connection_dispatch_io(NDhcp4CConnection *connection,
+                                       serv_addr, sizeof(serv_addr)));
+         }
+ 
++        if (type == N_DHCP4_MESSAGE_NAK &&
++            connection->request->userdata.server_id != INADDR_ANY) {
++                struct in_addr server;
++
++                r = n_dhcp4_incoming_query_server_identifier(message, &server);
++                if (r)
++                        return N_DHCP4_E_AGAIN;
++
++                if (connection->request->userdata.server_id != server.s_addr) {
++                        n_dhcp4_log(connection->log_queue,
++                                    LOG_DEBUG,
++                                    "discarded NAK with wrong server-id %s",
++                                    inet_ntop(AF_INET, &server,
++                                              serv_addr, sizeof(serv_addr)));
++                        return N_DHCP4_E_AGAIN;
++                }
++        }
++
+         switch (type) {
+         case N_DHCP4_MESSAGE_OFFER:
+         case N_DHCP4_MESSAGE_ACK:
+diff --git a/src/n-dhcp4/src/n-dhcp4-private.h b/src/n-dhcp4/src/n-dhcp4-private.h
+index db7b24ff7d..191e946e70 100644
+--- a/src/n-dhcp4/src/n-dhcp4-private.h
++++ b/src/n-dhcp4/src/n-dhcp4-private.h
+@@ -202,6 +202,7 @@ struct NDhcp4Outgoing {
+                 uint8_t type;
+                 uint8_t message_type;
+                 uint32_t client_addr;
++                uint32_t server_id;
+                 uint64_t start_time;
+                 uint64_t base_time;
+                 uint64_t send_time;
+-- 
+2.35.1
+

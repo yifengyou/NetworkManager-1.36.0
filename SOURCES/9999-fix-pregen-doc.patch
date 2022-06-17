@@ -1,0 +1,44 @@
+From 9603d930557bcd8268c3e36897db9941ea3af0b7 Mon Sep 17 00:00:00 2001
+From: Thomas Haller <thaller@redhat.com>
+Date: Tue, 27 Aug 2019 15:47:32 +0200
+Subject: [PATCH] patch documentation with the proper default values
+
+We don't regenerate the documentation for RHEL builds, but
+the docs from the tarball are generated with a certain set
+of defaults.
+
+Patch the man pages with the proper values.
+---
+ docs/api/html/NetworkManager.conf.html | 2 +-
+ man/NetworkManager.conf.5              | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/docs/api/html/NetworkManager.conf.html b/docs/api/html/NetworkManager.conf.html
+index 02029c2e336a..cf9269c7bef4 100644
+--- a/docs/api/html/NetworkManager.conf.html
++++ b/docs/api/html/NetworkManager.conf.html
+@@ -663,7 +663,7 @@ unmanaged-devices=mac:00:22:68:1c:59:b1;mac:00:1E:65:30:D1:C4;interface-name:eth
+           are "<code class="literal">syslog</code>" and "<code class="literal">journal</code>".
+           When NetworkManager is started with "<code class="literal">--debug</code>"
+           in addition all messages will be printed to stderr.
+-          If unspecified, the default is "<code class="literal">syslog</code>".
++          If unspecified, the default is "<code class="literal">journal</code>".
+           </p></td>
+ </tr>
+ <tr>
+diff --git a/man/NetworkManager.conf.5 b/man/NetworkManager.conf.5
+index 4f62ed7c0cde..74daf4c8dc02 100644
+--- a/man/NetworkManager.conf.5
++++ b/man/NetworkManager.conf.5
+@@ -669,7 +669,7 @@ INFO\&.
+ .PP
+ \fIbackend\fR
+ .RS 4
+-The logging backend\&. Supported values are "syslog" and "journal"\&. When NetworkManager is started with "\-\-debug" in addition all messages will be printed to stderr\&. If unspecified, the default is "syslog"\&.
++The logging backend\&. Supported values are "syslog" and "journal"\&. When NetworkManager is started with "\-\-debug" in addition all messages will be printed to stderr\&. If unspecified, the default is "journal"\&.
+ .RE
+ .PP
+ \fIaudit\fR
+-- 
+2.31.1
+

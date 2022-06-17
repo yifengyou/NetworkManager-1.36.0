@@ -1,0 +1,332 @@
+From b55842ac0803b59fe8675464191180e44634ce1f Mon Sep 17 00:00:00 2001
+From: Thomas Haller <thaller@redhat.com>
+Date: Tue, 22 Feb 2022 22:08:18 +0100
+Subject: [PATCH 1/2] core: reject unsupported flags for CheckpointCreate D-Bus
+ request
+
+(cherry picked from commit df6ee44fb2b96cf05aaeeee500c75d7d91b37404)
+(cherry picked from commit 4cfc2245d382b0b869bd52238eecd17f1c10af1c)
+---
+ src/core/nm-manager.c | 34 +++++++++++++++++++++++++---------
+ 1 file changed, 25 insertions(+), 9 deletions(-)
+
+diff --git a/src/core/nm-manager.c b/src/core/nm-manager.c
+index b440b22457f2..53ef1754bb72 100644
+--- a/src/core/nm-manager.c
++++ b/src/core/nm-manager.c
+@@ -7453,15 +7453,30 @@ impl_manager_checkpoint_create(NMDBusObject                      *obj,
+                                GDBusMethodInvocation             *invocation,
+                                GVariant                          *parameters)
+ {
+-    NMManager        *self = NM_MANAGER(obj);
+-    NMManagerPrivate *priv = NM_MANAGER_GET_PRIVATE(self);
+-    NMAuthChain      *chain;
+-    char            **devices;
+-    guint32           rollback_timeout;
+-    guint32           flags;
++    NMManager         *self = NM_MANAGER(obj);
++    NMManagerPrivate  *priv = NM_MANAGER_GET_PRIVATE(self);
++    NMAuthChain       *chain;
++    gs_strfreev char **devices = NULL;
++    guint32            rollback_timeout;
++    guint32            flags;
+ 
+     G_STATIC_ASSERT_EXPR(sizeof(flags) <= sizeof(NMCheckpointCreateFlags));
+ 
++    g_variant_get(parameters, "(^aouu)", &devices, &rollback_timeout, &flags);
++
++    if ((NMCheckpointCreateFlags) flags != flags
++        || NM_FLAGS_ANY(flags,
++                        ~((guint32) (NM_CHECKPOINT_CREATE_FLAG_DESTROY_ALL
++                                     | NM_CHECKPOINT_CREATE_FLAG_DELETE_NEW_CONNECTIONS
++                                     | NM_CHECKPOINT_CREATE_FLAG_DISCONNECT_NEW_DEVICES
++                                     | NM_CHECKPOINT_CREATE_FLAG_ALLOW_OVERLAPPING)))) {
++        g_dbus_method_invocation_return_error_literal(invocation,
++                                                      NM_MANAGER_ERROR,
++                                                      NM_MANAGER_ERROR_INVALID_ARGUMENTS,
++                                                      "Invalid flags");
++        return;
++    }
++
+     chain = nm_auth_chain_new_context(invocation, checkpoint_auth_done_cb, self);
+     if (!chain) {
+         g_dbus_method_invocation_return_error_literal(invocation,
+@@ -7471,11 +7486,12 @@ impl_manager_checkpoint_create(NMDBusObject                      *obj,
+         return;
+     }
+ 
+-    g_variant_get(parameters, "(^aouu)", &devices, &rollback_timeout, &flags);
+-
+     c_list_link_tail(&priv->auth_lst_head, nm_auth_chain_parent_lst_list(chain));
+     nm_auth_chain_set_data(chain, "audit-op", NM_AUDIT_OP_CHECKPOINT_CREATE, NULL);
+-    nm_auth_chain_set_data(chain, "devices", devices, (GDestroyNotify) g_strfreev);
++    nm_auth_chain_set_data(chain,
++                           "devices",
++                           g_steal_pointer(&devices),
++                           (GDestroyNotify) g_strfreev);
+     nm_auth_chain_set_data(chain, "flags", GUINT_TO_POINTER(flags), NULL);
+     nm_auth_chain_set_data(chain, "timeout", GUINT_TO_POINTER(rollback_timeout), NULL);
+     nm_auth_chain_add_call(chain, NM_AUTH_PERMISSION_CHECKPOINT_ROLLBACK, TRUE);
+-- 
+2.35.1
+
+
+From 3c417c8338bf44292d4869763587286c7d492c0c Mon Sep 17 00:00:00 2001
+From: Thomas Haller <thaller@redhat.com>
+Date: Tue, 22 Feb 2022 21:55:57 +0100
+Subject: [PATCH 2/2] core: preserve external ports during checkpoint rollback
+
+When we have a bridge interface with ports attached externally (that is,
+not by NetworkManager itself), then it can make sense that during
+checkpoint rollback we want to keep those ports attached.
+
+During rollback, we may need to deactivate the bridge device and
+re-activate it. Implement this, by setting a flag before deactivating,
+which prevents external ports to be detached. The flag gets cleared,
+when the device state changes to activated (the following activation)
+or unmanaged.
+
+This is an ugly solution, for several reasons.
+
+For one, NMDevice tracks its ports in the "slaves" list. But what
+it does is ugly. There is no clear concept to understand what it
+actually tacks. For example, it tracks externally added interfaces
+(nm_device_sys_iface_state_is_external()) that are attached while
+not being connected. But it also tracks interfaces that we want to attach
+during activation (but which are not yet actually enslaved). It also tracks
+slaves that have no actual netdev device (OVS). So it's not clear what this
+list contains and what it should contain at any point in time. When we skip
+the change of the slaves states during nm_device_master_release_slaves_all(),
+it's not really clear what the effects are. It's ugly, but probably correct
+enough. What would be better, if we had a clear purpose of what the
+lists (or several lists) mean. E.g. a list of all ports that are
+currently, physically attached vs. a list of ports we want to attach vs.
+a list of OVS slaves that have no actual netdev device.
+
+Another problem is that we attach state on the device
+("activation_state_preserve_external_ports"), which should linger there
+during the deactivation and reactivation. How can we be sure that we don't
+leave that flag dangling there, and that the desired following activation
+is the one we cared about? If the follow-up activation fails short (e.g. an
+unmanaged command comes first), will we properly disconnect the slaves?
+Should we even? In practice, it might be correct enough.
+
+Also, we only implement this for bridges. I think this is where it makes
+the most sense. And after all, it's an odd thing to preserve unknown,
+external things during a rollback -- unknown, because we have no knowledge
+about why these ports are attached and what to do with them.
+
+Also, the change doesn't remember the ports that were attached when the
+checkpoint was created. Instead, we preserve all ports that are attached
+during rollback. That seems more useful and easier to implement. So we
+don't actually rollback to the configuration when the checkpoint was
+created. Instead, we rollback, but keep external devices.
+
+Also, we do this now by default and introduce a flag to get the previous
+behavior.
+
+https://bugzilla.redhat.com/show_bug.cgi?id=2035519
+https://gitlab.freedesktop.org/NetworkManager/NetworkManager/-/issues/ # 909
+(cherry picked from commit 98b3056604fc565f273c264b892086a75a4db0e9)
+(cherry picked from commit 351ca13358f62f85af675672c3399141bec092cd)
+---
+ src/core/devices/nm-device.c              | 71 ++++++++++++++++++++++-
+ src/core/devices/nm-device.h              |  2 +
+ src/core/nm-checkpoint.c                  |  5 ++
+ src/core/nm-manager.c                     |  3 +-
+ src/libnm-core-public/nm-dbus-interface.h | 16 +++--
+ 5 files changed, 90 insertions(+), 7 deletions(-)
+
+diff --git a/src/core/devices/nm-device.c b/src/core/devices/nm-device.c
+index 35360ceebb7b..a11486d54be3 100644
+--- a/src/core/devices/nm-device.c
++++ b/src/core/devices/nm-device.c
+@@ -76,6 +76,7 @@
+ #include "nm-hostname-manager.h"
+ 
+ #include "nm-device-generic.h"
++#include "nm-device-bridge.h"
+ #include "nm-device-vlan.h"
+ #include "nm-device-vrf.h"
+ #include "nm-device-wireguard.h"
+@@ -483,9 +484,12 @@ typedef struct _NMDevicePrivate {
+ 
+     NMUtilsStableType current_stable_id_type : 3;
+ 
++    bool activation_state_preserve_external_ports : 1;
++
+     bool nm_owned : 1; /* whether the device is a device owned and created by NM */
+ 
+-    bool  assume_state_guess_assume : 1;
++    bool assume_state_guess_assume : 1;
++
+     char *assume_state_connection_uuid;
+ 
+     guint64 udi_id;
+@@ -7666,8 +7670,19 @@ nm_device_master_release_slaves(NMDevice *self)
+     c_list_for_each_safe (iter, safe, &priv->slaves) {
+         SlaveInfo *info = c_list_entry(iter, SlaveInfo, lst_slave);
+ 
++        if (priv->activation_state_preserve_external_ports
++            && nm_device_sys_iface_state_is_external(info->slave)) {
++            _LOGT(LOGD_DEVICE,
++                  "master: preserve external port %s",
++                  nm_device_get_iface(info->slave));
++            continue;
++        }
+         nm_device_master_release_one_slave(self, info->slave, TRUE, FALSE, reason);
+     }
++
++    /* We only need this flag for a short time. It served its purpose. Clear
++     * it again. */
++    nm_device_activation_state_set_preserve_external_ports(self, FALSE);
+ }
+ 
+ /**
+@@ -15386,6 +15401,16 @@ _set_state_full(NMDevice *self, NMDeviceState state, NMDeviceStateReason reason,
+     if (state > NM_DEVICE_STATE_DISCONNECTED)
+         nm_device_assume_state_reset(self);
+ 
++    if (state < NM_DEVICE_STATE_UNAVAILABLE
++        || (state >= NM_DEVICE_STATE_IP_CONFIG && state < NM_DEVICE_STATE_ACTIVATED)) {
++        /* preserve-external-ports is used by NMCheckpoint to activate a master
++         * device, and preserve already attached ports. This means, this state is only
++         * relevant during the deactivation and the following activation of the
++         * right profile. Once we are sufficiently far in the activation of the
++         * intended profile, we clear the state again. */
++        nm_device_activation_state_set_preserve_external_ports(self, FALSE);
++    }
++
+     if (state <= NM_DEVICE_STATE_UNAVAILABLE) {
+         if (available_connections_del_all(self))
+             _notify(self, PROP_AVAILABLE_CONNECTIONS);
+@@ -15790,6 +15815,50 @@ nm_device_get_state(NMDevice *self)
+     return NM_DEVICE_GET_PRIVATE(self)->state;
+ }
+ 
++/*****************************************************************************/
++
++/**
++ * nm_device_activation_state_set_preserve_external_ports:
++ * @self: the NMDevice.
++ * @flag: whether to set or clear the the flag.
++ *
++ * This sets an internal flag to true, which does something specific.
++ * For non-master devices, it has no effect. For master devices, this
++ * will prevent to detach all external ports, until the next activation
++ * completes.
++ *
++ * This is used during checkpoint/rollback. We may want to preserve
++ * externally attached ports during the restore. NMCheckpoint will
++ * call this before doing a re-activation. By setting the flag,
++ * we basically preserve such ports.
++ *
++ * Once we reach again ACTIVATED state, the flag gets cleared. This
++ * only has effect for the next activation cycle. */
++void
++nm_device_activation_state_set_preserve_external_ports(NMDevice *self, gboolean flag)
++{
++    NMDevicePrivate *priv;
++
++    g_return_if_fail(NM_IS_DEVICE(self));
++
++    priv = NM_DEVICE_GET_PRIVATE(self);
++
++    if (!NM_IS_DEVICE_BRIDGE(self)) {
++        /* This is actually only implemented for bridge devices. While it might
++         * make sense for bond/team or OVS, it's not clear that it is actually
++         * useful or desirable. */
++        return;
++    }
++
++    if (priv->activation_state_preserve_external_ports == flag)
++        return;
++
++    priv->activation_state_preserve_external_ports = flag;
++    _LOGD(LOGD_DEVICE,
++          "activation-state: preserve-external-ports %s",
++          flag ? "enabled" : "disabled");
++}
++
+ /*****************************************************************************/
+ /* NMConfigDevice interface related stuff */
+ 
+diff --git a/src/core/devices/nm-device.h b/src/core/devices/nm-device.h
+index cfcd4ade6d80..a7badb861087 100644
+--- a/src/core/devices/nm-device.h
++++ b/src/core/devices/nm-device.h
+@@ -444,6 +444,8 @@ NMDeviceType nm_device_get_device_type(NMDevice *dev);
+ NMLinkType   nm_device_get_link_type(NMDevice *dev);
+ NMMetered    nm_device_get_metered(NMDevice *dev);
+ 
++void nm_device_activation_state_set_preserve_external_ports(NMDevice *self, gboolean flag);
++
+ guint32 nm_device_get_route_table(NMDevice *self, int addr_family);
+ guint32 nm_device_get_route_metric(NMDevice *dev, int addr_family);
+ 
+diff --git a/src/core/nm-checkpoint.c b/src/core/nm-checkpoint.c
+index 0153af970de7..5b48f91aa515 100644
+--- a/src/core/nm-checkpoint.c
++++ b/src/core/nm-checkpoint.c
+@@ -282,6 +282,11 @@ restore_and_activate_connection(NMCheckpoint *self, DeviceCheckpoint *dev_checkp
+          * an internal subject. */
+         if (nm_device_get_state(dev_checkpoint->device) > NM_DEVICE_STATE_DISCONNECTED
+             && nm_device_get_state(dev_checkpoint->device) < NM_DEVICE_STATE_DEACTIVATING) {
++            if (!NM_FLAGS_HAS(priv->flags, NM_CHECKPOINT_CREATE_FLAG_NO_PRESERVE_EXTERNAL_PORTS)) {
++                nm_device_activation_state_set_preserve_external_ports(dev_checkpoint->device,
++                                                                       TRUE);
++            }
++
+             nm_device_state_changed(dev_checkpoint->device,
+                                     NM_DEVICE_STATE_DEACTIVATING,
+                                     NM_DEVICE_STATE_REASON_NEW_ACTIVATION);
+diff --git a/src/core/nm-manager.c b/src/core/nm-manager.c
+index 53ef1754bb72..6c73d237c845 100644
+--- a/src/core/nm-manager.c
++++ b/src/core/nm-manager.c
+@@ -7469,7 +7469,8 @@ impl_manager_checkpoint_create(NMDBusObject                      *obj,
+                         ~((guint32) (NM_CHECKPOINT_CREATE_FLAG_DESTROY_ALL
+                                      | NM_CHECKPOINT_CREATE_FLAG_DELETE_NEW_CONNECTIONS
+                                      | NM_CHECKPOINT_CREATE_FLAG_DISCONNECT_NEW_DEVICES
+-                                     | NM_CHECKPOINT_CREATE_FLAG_ALLOW_OVERLAPPING)))) {
++                                     | NM_CHECKPOINT_CREATE_FLAG_ALLOW_OVERLAPPING
++                                     | NM_CHECKPOINT_CREATE_FLAG_NO_PRESERVE_EXTERNAL_PORTS)))) {
+         g_dbus_method_invocation_return_error_literal(invocation,
+                                                       NM_MANAGER_ERROR,
+                                                       NM_MANAGER_ERROR_INVALID_ARGUMENTS,
+diff --git a/src/libnm-core-public/nm-dbus-interface.h b/src/libnm-core-public/nm-dbus-interface.h
+index fe2a6c09db58..0d23c7d7a793 100644
+--- a/src/libnm-core-public/nm-dbus-interface.h
++++ b/src/libnm-core-public/nm-dbus-interface.h
+@@ -959,17 +959,23 @@ typedef enum {
+  *   overlapping younger checkpoints. This opts-in that the
+  *   checkpoint can be automatically destroyed by the rollback
+  *   of an older checkpoint. Since: 1.12.
++ * @NM_CHECKPOINT_CREATE_FLAG_NO_PRESERVE_EXTERNAL_PORTS: during rollback,
++ *   by default externally added ports attached to bridge devices are preserved.
++ *   With this flag, the rollback detaches all external ports.
++ *   This only has an effect for bridge ports. Before 1.38, 1.36.2, this was the default
++ *   behavior. Since: 1.38, 1.36.2.
+  *
+  * The flags for CheckpointCreate call
+  *
+  * Since: 1.4 (gi flags generated since 1.12)
+  */
+ typedef enum { /*< flags >*/
+-               NM_CHECKPOINT_CREATE_FLAG_NONE                   = 0,
+-               NM_CHECKPOINT_CREATE_FLAG_DESTROY_ALL            = 0x01,
+-               NM_CHECKPOINT_CREATE_FLAG_DELETE_NEW_CONNECTIONS = 0x02,
+-               NM_CHECKPOINT_CREATE_FLAG_DISCONNECT_NEW_DEVICES = 0x04,
+-               NM_CHECKPOINT_CREATE_FLAG_ALLOW_OVERLAPPING      = 0x08,
++               NM_CHECKPOINT_CREATE_FLAG_NONE                       = 0,
++               NM_CHECKPOINT_CREATE_FLAG_DESTROY_ALL                = 0x01,
++               NM_CHECKPOINT_CREATE_FLAG_DELETE_NEW_CONNECTIONS     = 0x02,
++               NM_CHECKPOINT_CREATE_FLAG_DISCONNECT_NEW_DEVICES     = 0x04,
++               NM_CHECKPOINT_CREATE_FLAG_ALLOW_OVERLAPPING          = 0x08,
++               NM_CHECKPOINT_CREATE_FLAG_NO_PRESERVE_EXTERNAL_PORTS = 0x10,
+ } NMCheckpointCreateFlags;
+ 
+ /**
+-- 
+2.35.1
+
